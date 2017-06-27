@@ -11,24 +11,52 @@
 
 #include "application.h"
 #include "clickButton.h"
+#include "Serial4/Serial4.h"
 //#include "carloop.h"
 //#include "socketcan_serial.h"
 
 SYSTEM_THREAD(ENABLED);
 
+#define LIST_LEN 700
+
+struct dataInfo {
+  bool enable = false;
+  bool modify = false;
+  uint8_t current = 0x00;
+  uint8_t previous = 0x00;
+  uint8_t modified = 0x00;
+};
+
+struct IDinfo {
+  bool enable = false;
+  bool modify = false;
+  int id;
+  int frequency; 
+  dataInfo data[8];
+};
+
+IDinfo CAN1_IDlist[LIST_LEN];
+IDinfo CAN2_IDlist[LIST_LEN];
+
+
 bool filterCAN(CANMessage &m);
-CANMessage modifyData(int i);
-void transmitCAN();
-bool appendToList(CANMessage &m);
-void sortIDs();
-void socketcanReceiveMessages();
-void printReceivedMessage(const CANMessage &message);
+CANMessage modifyData(int i, IDinfo (&IDlist)[LIST_LEN], int SER);
+void transmitCAN(CANChannel can, IDinfo (&IDlist)[LIST_LEN], int IDcount, int SER);
+int getMode(int BUS);
+bool appendToList(CANMessage &m, IDinfo (&IDlist)[LIST_LEN], int IDcount, int BUS);
+void sortIDs(IDinfo (&IDlist)[LIST_LEN], int IDcount);
+void socketcanReceiveMessages(CANChannel can, int SER);
+void printReceivedMessage(const CANMessage &message, int SER);
+void checkButtons(IDinfo (&IDlist)[LIST_LEN], int IDcount);
 void doEncoderA();
 void doEncoderB();
-void enableAll();
-void listIDs(int i);
-void refresh();
-void displayMenu();
+void enableAll(IDinfo (&IDlist)[LIST_LEN], int IDcount);
+void listIDs(int i, IDinfo (&IDlist)[LIST_LEN], int IDcount);
+void refresh(IDinfo (&IDlist)[LIST_LEN], int IDcount);
+void displayMenu(IDinfo (&IDlist)[LIST_LEN], int IDcount);
+void recvWithStartEndMarkers();
+//void serialSwitch(Stream &serial);
+//void showNewData();
 
 
 int encoderA = D4;
@@ -54,23 +82,29 @@ int led = D7;
 #define REFESH_RATE 500
 #define SCREEN_BUFFER 26
 
+#define BUS_1 1
+#define BUS_2 2
+
+#define SER_1 1
+#define SER_2 2
+
 static int sel = 0;
 static int data_select = 0;
 
 long timeOfLastRefresh = 0;
 
 // The 2 CAN controllers on the Electron
-CANChannel can1(CAN_D1_D2);
-CANChannel can2(CAN_C4_C5);
+CANChannel can1(CAN_C4_C5);
+CANChannel can2(CAN_D1_D2);
 
 const char NEW_LINE = '\r';
 char inputBuffer[40];
 unsigned inputPos = 0;
 
 CANMessage spoofM;
-//CANMessage CANrecord[1];
-//int recording = 0;
-//int recordCount = 0;
+
+int can1mode = 2;
+int can2mode = 1;
 
 // Modify if your CAN bus has a different speed / baud rate
 const auto speed = 500000; // bits/s
@@ -78,25 +112,11 @@ PMIC _pmic;
 
 bool enableAllState = true;
 
-struct dataInfo {
-  bool enable = false;
-  bool modify = false;
-  uint8_t current = 0x00;
-  uint8_t previous = 0x00;
-  uint8_t modified = 0x00;
-};
+int CAN1_IDcount = 0;
+int CAN2_IDcount = 0;
 
-struct IDinfo {
-  bool enable = false;
-  bool modify = false;
-  int id;
-  int frequency; 
-  dataInfo data[8];
-};
-
-IDinfo IDlist[1700];
-
-int IDcount = 0;
+const size_t READ_BUF_SIZE = 64;
+size_t readBufOffset = 0;
 
 /* every
  * Helper than runs a function at a regular millisecond interval
@@ -118,8 +138,10 @@ void setup() {
   can2.begin(speed);  // for transmitting from deciever
 
   // Setup serial connections 
-  Serial.begin(9600);
-  USBSerial1.begin(9600);
+
+  Serial.begin(9600);      //"Serial" is used only for sniffing via socketcan 
+  USBSerial1.begin(9600);  //"USBSerial1" is used only to display filtering interface, except when both are in sniffer mode
+  Serial4.begin(9600);     //"Serial4" is used for mode management from RasPi python script
 
   while (!USBSerial1) delay(100);
 
@@ -139,7 +161,7 @@ void setup() {
   selectButton.longClickTime  = 1000; // time until "held-down clicks" register
 
   // Refresh menu interface
-  refresh();
+  refresh(CAN1_IDlist, CAN1_IDcount);
 
 }
 
@@ -148,46 +170,116 @@ void loop() {
   CANMessage m;
   CANMessage m2;
 
-  socketcanReceiveMessages();
-
-  
-
-  if (can2.receive(m)) {
-      appendToList(m);
-      sortIDs();
-  }
-
-  transmitCAN();
-
-
-  // Check button and encoder to update menu
+  //Serial4.print(0);
+  //Serial4.print(1);
 
   selectButton.Update();
 
-  if(selectButton.clicks == 1){
-      selection = 1;
-      displayMenu();
+  //serialSwitch(USBSerial1);
+
+  recvWithStartEndMarkers();
+  //showNewData();
+  
+  can1mode = getMode(BUS_1);
+  //USBSerial1.println(can1mode);
+
+
+  switch (can1mode){
+
+      case 0 : // OFF
+          USBSerial1.print("\033[2J"); // clear screen
+        //USBSerial1.print("\033[H"); // cursor to home
+          USBSerial1.printf("OFF\r");
+
+          break;
+
+      case 1 : // cansniffer mode
+
+          /*if( can2mode == 2 )
+              socketcanReceiveMessages(can1, SER_2);
+          else*/
+              socketcanReceiveMessages(can1, SER_1);
+
+          break;
+
+      case 2 : // input side of filter mode
+          if (can1.receive(m)){
+
+              appendToList(m, CAN1_IDlist, CAN1_IDcount, BUS_1);
+              //sortIDs(CAN1_IDlist);
+
+          }
+
+          checkButtons(CAN1_IDlist, CAN1_IDcount);
+
+          if( (millis() - timeOfLastRefresh) > REFESH_RATE){
+              refresh(CAN1_IDlist, CAN1_IDcount);
+          }
+
+          break;
+
+      case 3 : // output side of filter mode
+
+          socketcanReceiveMessages(can1, SER_2);
+          transmitCAN(can1, CAN2_IDlist, CAN2_IDcount, SER_2);
+
+          break;
+
+      default :
+          USBSerial1.printf("BAD\r");
+          //USBSerial1.print(can1mode);
+
   }
 
-  if( prevPos != encoderPos ) {
-      if( prevPos > encoderPos ){
-          updown = 1;
-      }else{
-          updown = 0;
-      }
-      prevPos = encoderPos;
-      displayMenu();
-  }
+  //can2mode = getMode(BUS_2);
+  //can2mode = 1;
 
-  // Automatically refresh menu every so often (could use 'every' template)
+  switch (can2mode){
 
-  if( (millis() - timeOfLastRefresh) > REFESH_RATE){
-      refresh();
+      case 0 : // OFF
+
+          Serial.println("OFF\r");
+
+          break;
+
+      case 1 : // cansniffer mode
+
+          socketcanReceiveMessages(can2, SER_2);
+
+          break;
+
+      case 2 : // input side of filter mode
+
+          if (can2.receive(m)){
+
+              appendToList(m, CAN2_IDlist, CAN2_IDcount, BUS_2);
+              //sortIDs(CAN2_IDlist);
+          }
+
+          checkButtons(CAN2_IDlist, CAN2_IDcount);
+
+          if( (millis() - timeOfLastRefresh) > REFESH_RATE){
+              refresh(CAN2_IDlist, CAN2_IDcount);
+          }
+
+          break;
+
+      case 3 : // output side of filter mode
+
+          socketcanReceiveMessages(can2, SER_2);
+          transmitCAN(can2, CAN1_IDlist, CAN1_IDcount, SER_2);
+
+          break;
+
+      default :
+          Serial.println("BAD MODE");
+
   }
+    
 }
 
 // Modify or drop the messages intercepted by the man-in-the-middle device
-bool filterCAN(CANMessage &m) {
+/*bool filterCAN(CANMessage &m, IDinfo IDlist) {
   // return false to drop the message
   for( int i = 0 ; i < IDcount ; i++){
     if( m.id == IDlist[i].id ){
@@ -195,9 +287,9 @@ bool filterCAN(CANMessage &m) {
     }
   }
   return false;
-}
+}*/
 
-CANMessage modifyData(int i){
+CANMessage modifyData(int i, IDinfo (&IDlist)[LIST_LEN], int SER){
   CANMessage m;
   m.id = IDlist[i].id;
   m.len = 8;
@@ -208,20 +300,12 @@ CANMessage modifyData(int i){
         m.data[j] = IDlist[i].data[j].current;
       }
     }
-    printReceivedMessage(m);
+    printReceivedMessage(m, SER);
     return m;
 }
 
 
-/*CANMessage blockData(int i){
-  CANMessage m;
-  m.id = IDlist[i].id;
-  m.len = 8;
-    for( int j = 0 ; j < 8 ; j++){
-        m.data[j] = IDlist[j].data[j].previous;
-    }
-  return m;
-}
+/*
 
 void spoofData(){
   // write to the data array to modify the message
@@ -241,27 +325,113 @@ void spoofData(){
 }
 */
 
-void transmitCAN() {
-  every(10, [] {
+/*void serialSwitch(Stream &serial){
+
+  serial.print("serial switched");
+
+}*/
+
+void transmitCAN(CANChannel can, IDinfo (&IDlist)[LIST_LEN], int IDcount, int SER) {
+  //every(10, [] {
 
     for( int i = 0 ; i < IDcount ; i++){
       if( IDlist[i].enable ){
-          can1.transmit(modifyData(i));
-      }else{
-        //can1.transmit(blockData(i));
+          can.transmit(modifyData(i, IDlist, SER));
+      }
+
+  //});
+  }
+}
+
+const byte numChars = 90;
+char receivedChars[numChars];
+
+boolean newData = false;
+
+void recvWithStartEndMarkers() {
+  static boolean recvInProgress = false;
+  static byte ndx = 0;
+  char startMarker = '<';
+  char endMarker = '>';
+  char rc;
+
+  while (Serial4.available() > 0 && newData == false) { // <<== NEW - get all bytes from buffer
+    rc = Serial4.read();
+
+    if (recvInProgress == true) {
+      if (rc != endMarker) {
+        receivedChars[ndx] = rc;
+        ndx++;
+        if (ndx >= numChars) {
+          ndx = numChars - 1;
+        }
+      }
+      else {
+        receivedChars[ndx] = '\0'; // terminate the string
+        recvInProgress = false;
+        ndx = 0;
+        newData = true;
       }
     }
 
-  });
+    else if (rc == startMarker) {
+      recvInProgress = true;
+    }
+  }
+}
+
+/*void showNewData() {
+  if (newData == true) {
+    USBSerial1.print("This just in ... ");
+    USBSerial1.println(receivedChars);
+    newData = false;
+  }
+}*/
+
+int getMode( int BUS ){
+
+  uint8_t check;
+  uint8_t mode;
+
+  check = receivedChars[0];
+  mode = receivedChars[1];
+  //USBSerial1.print(check);
+  //USBSerial1.println(mode);
+
+  /*if(check == 49 && BUS == 2){  // received 01, but looking for 02
+    return can2mode;            // return current mode
+
+  }else if(check == 50 && BUS == 1){ // received 02, but looking for 01
+    return can1mode;                 // return current mode
+  }*/
+
+  if(mode == 79) // ASCII for O 
+      return 0;
+  else if(mode == 83) //ASCII for S
+      return 1;
+  else if(mode == 73) //ASCII for I
+      return 2;
+  else if(mode == 70) //ASCII for F
+      return 3;
+  else if(mode == 82) //ASCII for R
+      return 1;
+  else if(mode == 80) //ASCII for P
+      return 1;
+  /*else
+      if(BUS == 1)
+          return can1mode;
+      else if (BUS == 2)
+          return can2mode;*/
+
 }
 
 
-bool appendToList(CANMessage &m){
+bool appendToList(CANMessage &m, IDinfo (&IDlist)[LIST_LEN], int IDcount, int BUS){
     
     int match = 0;
     int trip = 1;
 
-    if( IDcount > 1699){
+    if( IDcount > LIST_LEN){
       return false;
     }
 
@@ -274,16 +444,27 @@ bool appendToList(CANMessage &m){
     if (trip == 1){
           IDcount++;
           match = IDcount-1;
-             IDlist[match].id = m.id;
+          IDlist[match].id = m.id;
     }
     IDlist[match].frequency++;
     for( int j = 0 ; j < 8 ; j++){
         IDlist[match].data[j].current = m.data[j];
     }
-    return trip;
+    sortIDs(IDlist, IDcount);
+
+    if ( BUS == 1 ){
+      //CAN1_IDlist = IDlist;
+      CAN1_IDcount = IDcount;
+    }else{
+      //CAN2_IDlist = IDlist;
+      CAN2_IDcount = IDcount;
+    }
+
+    return true;
+
 }
 
-void sortIDs(){
+void sortIDs(IDinfo (&IDlist)[LIST_LEN], int IDcount){
   //Sort by priority
   struct IDinfo IDswap;
   int i, j;
@@ -295,6 +476,7 @@ void sortIDs(){
             IDlist[j+1] = IDswap;
         }
       }
+
   }
   //Sort by frequency
   /*for ( i = 0 ; i < IDcount - 1 ; i++){
@@ -311,21 +493,35 @@ void sortIDs(){
 
 // from socketcan_serial.cpp
 
-void socketcanReceiveMessages(){
+void socketcanReceiveMessages(CANChannel can, int SER){
   CANMessage message;
-  while(can1.receive(message))
+  while(can.receive(message))
   {
-    printReceivedMessage(message);
+    printReceivedMessage(message, SER);
     //applicationCanReceiver(message);
   }
 }
 
-void printReceivedMessage(const CANMessage &message){
-  Serial.printf("t%03x%d", message.id, message.len);
-  for(auto i = 0; i < message.len; i++) {
-    Serial.printf("%02x", message.data[i]);
-  }
-  Serial.write(NEW_LINE);
+void printReceivedMessage(const CANMessage &message, int SER){
+
+    if( SER == 1){
+        USBSerial1.printf("t%03x%d", message.id, message.len);
+        for(auto i = 0; i < message.len; i++) {
+          USBSerial1.printf("%02x", message.data[i]);
+        }
+        USBSerial1.write(NEW_LINE);
+
+    }
+
+    if( SER == 2){
+        Serial.printf("t%03x%d", message.id, message.len);
+        for(auto i = 0; i < message.len; i++) {
+          Serial.printf("%02x", message.data[i]);
+        }
+        Serial.write(NEW_LINE);
+
+    }
+  
 }
 
 
@@ -349,8 +545,33 @@ void doEncoderB(){
     }
 }
 
+void checkButtons(IDinfo (&IDlist)[LIST_LEN], int IDcount){
 
-void enableAll(){
+  //selectButton.Update();
+
+  if(selectButton.clicks == 1){
+      selection = 1;
+      displayMenu(IDlist, IDcount);
+  }
+
+  if( prevPos != encoderPos ) {
+      if( prevPos > encoderPos ){
+          updown = 1;
+      }else{
+          updown = 0;
+      }
+      prevPos = encoderPos;
+      displayMenu(IDlist, IDcount);
+  }
+
+}
+
+
+bool scroll_data = false;
+bool scroll_list = true;
+
+
+void enableAll(IDinfo (&IDlist)[LIST_LEN], int IDcount){
 
   for( int i = 0 ; i < IDcount ; i++){
       if( enableAllState ){
@@ -363,7 +584,7 @@ void enableAll(){
 
 }
 
-void listIDs(int i){
+void listIDs(int i, IDinfo (&IDlist)[LIST_LEN], int IDcount){
 
     if( sel == i+1 ){
         USBSerial1.print(SEL);    //highlight selected line
@@ -390,7 +611,7 @@ void listIDs(int i){
                   USBSerial1.print(CHANGING);
                   USBSerial1.printf("%02x ", IDlist[i].data[j].current);
               }else{
-                 USBSerial1.print(sel == i+1 ? SEL : RST);
+                 USBSerial1.print(sel == i+1 && scroll_data == 1 ? SEL : RST);
                  USBSerial1.printf("%02x ", IDlist[i].data[j].current);
               }
               IDlist[i].data[j].previous = IDlist[i].data[j].current;
@@ -407,7 +628,7 @@ void listIDs(int i){
       
 }
 
-void refresh() {
+void refresh(IDinfo (&IDlist)[LIST_LEN], int IDcount) {
 
     USBSerial1.print("\033[2J"); // clear screen
     USBSerial1.print("\033[H"); // cursor to home
@@ -424,26 +645,24 @@ void refresh() {
 
     if( sel < SCREEN_BUFFER ){
         for( int i = 0 ; i < SCREEN_BUFFER && i < IDcount ; i++ ){
-            listIDs(i);
+            listIDs(i, IDlist, IDcount);
         }
     }else{
         for( int i = 0 ; i < SCREEN_BUFFER && i < IDcount + i - SCREEN_BUFFER ; i++ ){
-            listIDs(sel + i - SCREEN_BUFFER);
+            listIDs(sel + i - SCREEN_BUFFER, IDlist, IDcount);
         }
     }
     USBSerial1.print(RST);
     timeOfLastRefresh = millis();
 }
 
-bool scroll_data = false;
-bool scroll_list = true;
 
-void displayMenu() {
+void displayMenu(IDinfo (&IDlist)[LIST_LEN], int IDcount) {
 
     if(selection == 1){  // push button pushed
 
         if( sel == 0 ){  
-            enableAll(); 
+            enableAll(IDlist, IDcount); 
         }else{
             if( scroll_list ){ 
 
@@ -492,7 +711,8 @@ void displayMenu() {
         if ( scroll_data ){
 
             if(IDlist[sel-1].data[data_select-1].modify){
-                IDlist[sel-1].data[data_select-1].modified -= 0x01;
+                if(IDlist[sel-1].data[data_select-1].modified > 0x00)
+                    IDlist[sel-1].data[data_select-1].modified -= 0x01;
             }else{
                 data_select = data_select <= 0 ? 0 : (data_select - 1);
             }
@@ -511,7 +731,8 @@ void displayMenu() {
                 data_select = 1;
             }else
             if(IDlist[sel-1].data[data_select-1].modify){
-                IDlist[sel-1].data[data_select-1].modified += 0x01;
+                if(IDlist[sel-1].data[data_select-1].modified < 0xFF)
+                    IDlist[sel-1].data[data_select-1].modified += 0x01;
             }
             else{
                 data_select = data_select >= 8 ? 8 : (data_select + 1);
@@ -520,6 +741,6 @@ void displayMenu() {
         
     }
 
-    refresh();
+    refresh(IDlist, IDcount);
     
 }
